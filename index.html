@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flush</title>
+<style>
+  :root { --ink:#111; --paper:#fff; --muted:#8c8c8c; --line:#dedede; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--paper); color: var(--ink);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  canvas {
+    position: fixed; inset: 0; display: block;
+    width: 100vw; height: 100vh;
+    touch-action: none; cursor: crosshair;
+  }
+  body.nodraw canvas { cursor: default; }
+
+  .bar {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 6px; padding: 6px; z-index: 2;
+    background: rgba(255,255,255,.92);
+    border: 1px solid var(--line); border-radius: 999px;
+  }
+  button {
+    font: inherit; font-size: 13px; letter-spacing: .02em;
+    padding: 7px 18px; border-radius: 999px; cursor: pointer;
+    border: 1px solid var(--ink); background: var(--paper); color: var(--ink);
+    transition: background .15s, color .15s;
+  }
+  button:hover { background: #f1f1f1; }
+  button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  .status {
+    position: fixed; top: 68px; left: 16px; right: 16px; z-index: 1;
+    text-align: center; font-size: 12px; color: var(--muted);
+    pointer-events: none; transition: opacity .4s;
+  }
+  .guide {
+    position: fixed; left: 16px; bottom: 16px; z-index: 1;
+    display: flex; align-items: center; gap: 10px;
+    font-size: 12px; color: var(--muted); opacity: .75;
+    pointer-events: none; transition: opacity .6s;
+  }
+  .guide.hidden { opacity: 0; }
+</style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <div class="bar" role="toolbar" aria-label="Tools">
+    <button id="draw" aria-pressed="true">Draw</button>
+    <button id="reset">Reset</button>
+    <button id="save">Save</button>
+  </div>
+
+  <div class="status" id="status">Draw anything. Then draw a toilet.</div>
+
+  <div class="guide" id="guide" aria-hidden="true">
+    <svg width="40" height="56" viewBox="0 0 40 56" fill="none" stroke="#9a9a9a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 26 V14 a11 11 0 0 1 22 0 V26"/>
+      <ellipse cx="20" cy="39" rx="16" ry="14"/>
+      <ellipse cx="20" cy="40" rx="9" ry="8"/>
+    </svg>
+    <span>Toilet = a half oval on top,<br>an oval inside an oval below.</span>
+  </div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- setup ----------
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const guideEl = document.getElementById('guide');
+  const drawBtn = document.getElementById('draw');
+
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  const LINE = 3;
+  let strokes = [];          // { id, pts:[{x,y}], role:'free'|'toilet', anim:null|{...} }
+  let current = null;
+  let nextId = 1;
+  let drawMode = true;
+  let toilet = null;         // { bowl:{cx,cy,a,b}, detectedAt }
+  let flushing = false;
+  let flushStart = 0;
+  let swirl = 0;             // whirlpool intensity 0..1
+  let idleTimer = null, flushTimer = null;
+
+  const setStatus = (t) => { statusEl.textContent = t; };
+  const now = () => performance.now() / 1000;
+  const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const smooth = (t) => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+
+  // ---------- input ----------
+  cv.addEventListener('pointerdown', (e) => {
+    if (!drawMode || e.button > 0) return;
+    cv.setPointerCapture(e.pointerId);
+    current = { id: nextId++, pts: [{ x: e.clientX, y: e.clientY }], role: 'free', anim: null };
+    strokes.push(current);
+    clearTimeout(idleTimer);
+  });
+  cv.addEventListener('pointermove', (e) => {
+    if (!current) return;
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const ev of (evs.length ? evs : [e])) {
+      const last = current.pts[current.pts.length - 1];
+      const p = { x: ev.clientX, y: ev.clientY };
+      if (dist(p, last) >= 1.5) current.pts.push(p);
+    }
+  });
+  const endStroke = () => {
+    if (!current) return;
+    const s = current; current = null;
+    if (s.pts.length < 2) s.pts.push({ x: s.pts[0].x + 0.1, y: s.pts[0].y });
+    afterStroke();
+  };
+  cv.addEventListener('pointerup', endStroke);
+  cv.addEventListener('pointercancel', endStroke);
+
+  function afterStroke() {
+    if (!toilet) {
+      const t = detectToilet();
+      if (t) onToiletDetected(t);
+    } else {
+      // The toilet is functional now: pause drawing and it flushes again.
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => startFlush(), 1600);
+    }
+  }
+
+  // ---------- geometry helpers ----------
+  function bbox(pts) {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of pts) {
+      if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+      if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+    }
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2 };
+  }
+
+  // Resample a closed polygon (including the closing segment) to n evenly spaced points.
+  function resampleClosed(pts, n) {
+    const ring = pts.concat([pts[0]]);
+    let L = 0;
+    for (let i = 1; i < ring.length; i++) L += dist(ring[i - 1], ring[i]);
+    const step = L / n, out = [{ x: ring[0].x, y: ring[0].y }];
+    let acc = 0;
+    for (let i = 1; i < ring.length && out.length < n; i++) {
+      let a = ring[i - 1]; const b = ring[i];
+      let d = dist(a, b);
+      while (acc + d >= step && out.length < n) {
+        const t = (step - acc) / d;
+        const q = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+        out.push(q); a = q; d = dist(a, b); acc = 0;
+      }
+      acc += d;
+    }
+    while (out.length < n) out.push({ x: ring[0].x, y: ring[0].y });
+    return out;
+  }
+
+  function polyArea(pts) {
+    let s = 0;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) s += (pts[j].x * pts[i].y - pts[i].x * pts[j].y);
+    return Math.abs(s) / 2;
+  }
+
+  // Count sharp corners along a closed, evenly resampled outline (rotation invariant).
+  function countCorners(rs) {
+    const n = rs.length, k = 3, flags = new Array(n).fill(false);
+    for (let i = 0; i < n; i++) {
+      const a = rs[(i - k + n) % n], b = rs[i], c = rs[(i + k) % n];
+      const v1x = b.x - a.x, v1y = b.y - a.y, v2x = c.x - b.x, v2y = c.y - b.y;
+      const m = Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y);
+      if (m < 1e-6) continue;
+      const ang = Math.acos(clamp((v1x * v2x + v1y * v2y) / m, -1, 1));
+      flags[i] = ang > (58 * Math.PI / 180);
+    }
+    if (flags.every(Boolean)) return 99;
+    let start = flags.indexOf(false), runs = 0;
+    for (let s = 1; s <= n; s++) {
+      const i = (start + s) % n, prev = (start + s - 1) % n;
+      if (flags[i] && !flags[prev]) runs++;
+    }
+    return runs;
+  }
+
+  // Classify one closed shape as bowl (oval / rounded) or tank (box).
+  function analyze(raw) {
+    if (raw.length < 6) return null;
+    let bb = bbox(raw);
+    const size = Math.max(bb.w, bb.h);
+    if (size < 24 || Math.min(bb.w, bb.h) < 10) return null;
+
+    // Closed? Find where the tail comes back closest to the start (trims overshoot).
+    let best = -1, bd = Infinity;
+    for (let i = Math.floor(raw.length * 0.55); i < raw.length; i++) {
+      const d = dist(raw[i], raw[0]);
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best < 0 || bd > Math.max(20, 0.3 * size)) return null;
+    const pts = raw.slice(0, best + 1);
+    if (pts.length < 6) return null;
+
+    const rs = resampleClosed(pts, 64);
+    bb = bbox(rs);
+    if (bb.w < 10 || bb.h < 10) return null;
+    const areaRatio = polyArea(rs) / (bb.w * bb.h);
+
+    // Fit to the bbox-inscribed ellipse: residuals + how far points reach into the corners.
+    const a = bb.w / 2, b = bb.h / 2;
+    const quadMax = [0, 0, 0, 0];
+    let dev = 0;
+    for (const p of rs) {
+      const nx = (p.x - bb.cx) / a, ny = (p.y - bb.cy) / b;
+      const r = Math.hypot(nx, ny);
+      dev += Math.abs(r - 1);
+      const q = (nx >= 0 ? 0 : 1) + (ny >= 0 ? 0 : 2);
+      if (r > quadMax[q]) quadMax[q] = r;
+    }
+    dev /= rs.length;
+    const boxCorners = quadMax.filter((r) => r > 1.2).length;
+    const sharp = countCorners(rs);
+
+    if (areaRatio < 0.45) return null;
+    const tank = areaRatio > 0.76 && (boxCorners >= 3 || (sharp >= 3 && sharp <= 6));
+    const bowl = !tank && areaRatio > 0.5 && areaRatio < 0.94 && sharp <= 2 && dev < 0.2;
+    return { tank, bowl, x: bb.x, y: bb.y, w: bb.w, h: bb.h, cx: bb.cx, cy: bb.cy };
+  }
+
+  // An open arch (upside-down U / half oval): both ends low, apex high, ends far apart.
+  function analyzeArch(raw) {
+    if (raw.length < 6) return null;
+    const bb = bbox(raw);
+    if (bb.w < 24 || bb.h < 15) return null;
+    const p0 = raw[0], p1 = raw[raw.length - 1];
+    if (dist(p0, p1) < 0.3 * Math.max(bb.w, bb.h)) return null;
+    if (Math.min(p0.y, p1.y) < bb.y + 0.55 * bb.h) return null;
+    if (Math.abs(p0.x - p1.x) < 0.55 * bb.w) return null;
+    let top = raw[0];
+    for (const p of raw) if (p.y < top.y) top = p;
+    if (top.x < Math.min(p0.x, p1.x) || top.x > Math.max(p0.x, p1.x)) return null;
+    return { x: bb.x, y: bb.y, w: bb.w, h: bb.h, cx: bb.cx, cy: bb.cy, endY: Math.max(p0.y, p1.y) };
+  }
+
+  // Inner oval sits inside the outer one (the seat ring and the bowl opening).
+  function nested(I, O) {
+    const m = 6;
+    if (I.x < O.x - m || I.y < O.y - m || I.x + I.w > O.x + O.w + m || I.y + I.h > O.y + O.h + m) return false;
+    const f = (I.w * I.h) / (O.w * O.h);
+    return f > 0.08 && f < 0.8;
+  }
+
+  // The arch (lid / tank seen from above) must sit on top of the seat.
+  function archRelation(A, O) {
+    if (A.cx < O.x || A.cx > O.x + O.w) return null;
+    if (A.w < 0.4 * O.w || A.w > 1.7 * O.w) return null;
+    if (A.endY < O.y - 0.35 * O.h || A.endY > O.y + 0.45 * O.h) return null;
+    if (A.y > O.y - 0.15 * O.h) return null;
+    return Math.abs(A.endY - O.y) / O.h;
+  }
+
+  // Tank must sit above (or above-behind) the bowl, close to it, at a sensible size.
+  function relation(T, B) {
+    if (!(T.cy < B.cy - 0.1 * B.h)) return null;
+    if (!(T.y < B.y)) return null;
+    if (B.cx > T.x && B.cx < T.x + T.w && B.cy > T.y && B.cy < T.y + T.h) return null;
+    const gx = Math.max(0, T.x - (B.x + B.w), B.x - (T.x + T.w));
+    const gy = Math.max(0, T.y - (B.y + B.h), B.y - (T.y + T.h));
+    const gap = Math.hypot(gx, gy);
+    if (gap > 0.45 * Math.max(B.w, B.h)) return null;
+    const ratio = (T.w * T.h) / (B.w * B.h);
+    if (ratio < 0.06 || ratio > 3) return null;
+    return gap / Math.max(B.w, B.h);
+  }
+
+  function detectToilet() {
+    const free = strokes.filter((s) => s.role === 'free' && !s.anim);
+    const closed = [], arches = [];
+    const add = (pts, ids) => {
+      const f = analyze(pts);
+      if (f) { f.ids = ids; closed.push(f); return; }
+      const a = analyzeArch(pts);
+      if (a) { a.ids = ids; arches.push(a); }
+    };
+    const apart = (...groups) => {
+      const seen = new Set();
+      for (const g of groups) for (const id of g.ids) { if (seen.has(id)) return false; seen.add(id); }
+      return true;
+    };
+    // Single strokes, plus chains of up to 4 consecutive strokes whose ends meet
+    // (so a box drawn as 4 lines still counts).
+    for (let i = 0; i < free.length; i++) {
+      let pts = free[i].pts.slice(), ids = [free[i].id];
+      add(pts, ids);
+      for (let j = i + 1; j < Math.min(free.length, i + 4); j++) {
+        const nx = free[j].pts, end = pts[pts.length - 1];
+        const d1 = dist(end, nx[0]), d2 = dist(end, nx[nx.length - 1]);
+        if (Math.min(d1, d2) > 26) break;
+        pts = pts.concat(d1 <= d2 ? nx : nx.slice().reverse());
+        ids = ids.concat(free[j].id);
+        add(pts, ids);
+      }
+    }
+    let best = null;
+    const consider = (bowl, parts, score) => {
+      if (score === null) return;
+      if (!best || score < best.score) best = { bowl, ids: parts.flatMap((p) => p.ids), score };
+    };
+
+    // Pattern 1 (main): seat = outer oval with an inner oval, lid/tank (arch or closed shape) on top.
+    for (const O of closed) for (const I of closed) {
+      if (O === I || !apart(O, I) || !nested(I, O)) continue;
+      for (const A of arches) if (apart(O, I, A)) consider(I, [O, I, A], archRelation(A, O));
+      for (const T of closed) if (T !== O && T !== I && apart(O, I, T)) consider(I, [O, I, T], relation(T, O));
+    }
+    if (best) return best;
+
+    // Pattern 2 (simple symbol): a box above a single oval.
+    for (const B of closed) for (const T of closed) {
+      if (!B.bowl || !T.tank || !apart(B, T)) continue;
+      consider(B, [B, T], relation(T, B));
+    }
+    return best;
+  }
+
+  function onToiletDetected({ bowl: B, ids: idList }) {
+    const ids = new Set(idList);
+    strokes.forEach((s) => { if (ids.has(s.id)) s.role = 'toilet'; });
+
+    // Small details attached to the toilet (seat line, handle, lid) stay with it.
+    const tp = strokes.filter((s) => s.role === 'toilet').flatMap((s) => s.pts);
+    const U = bbox(tp), pad = 10;
+    for (const s of strokes) {
+      if (s.role !== 'free') continue;
+      const sb = bbox(s.pts);
+      if (Math.max(sb.w, sb.h) > 0.8 * Math.max(U.w, U.h)) continue;
+      const inside = s.pts.filter((p) => p.x > U.x - pad && p.x < U.x + U.w + pad && p.y > U.y - pad && p.y < U.y + U.h + pad).length;
+      if (inside < 0.85 * s.pts.length) continue;
+      let touches = false;
+      outer: for (const p of s.pts) for (let k = 0; k < tp.length; k += 2) {
+        if (Math.abs(p.x - tp[k].x) < 9 && Math.abs(p.y - tp[k].y) < 9) { touches = true; break outer; }
+      }
+      if (touches) s.role = 'toilet';
+    }
+
+    toilet = { bowl: { cx: B.cx, cy: B.cy, a: B.w / 2, b: B.h / 2 }, detectedAt: now() };
+    guideEl.classList.add('hidden');
+    const others = strokes.some((s) => s.role === 'free');
+    setStatus(others ? 'Toilet detected.' : 'Toilet detected. Draw something, pause, and watch it go.');
+    if (others) flushTimer = setTimeout(startFlush, 650);
+  }
+
+  // ---------- flush ----------
+  function startFlush() {
+    if (!toilet) return;
+    const { cx, cy } = toilet.bowl;
+    const list = strokes.filter((s) => s.role === 'free' && !s.anim);
+    if (!list.length) return;
+    const t = now();
+    list.forEach((s) => {
+      const bb = bbox(s.pts);
+      s.c = { x: bb.cx, y: bb.cy };
+      s.size = Math.max(bb.w, bb.h, 1);
+      s.d0 = Math.hypot(bb.cx - cx, bb.cy - cy);
+    });
+    list.sort((p, q) => p.d0 - q.d0);
+    list.forEach((s, i) => {
+      const dx = s.c.x - cx, dy = s.c.y - cy;
+      const r = Math.max(Math.hypot(dx, dy), 1);
+      const phi = Math.atan2(dy, dx);
+      const a = { r, phi, rot: 0, s: 1, alpha: 1, off: { x: 0, y: 0 }, delay: Math.min(1.2, i * 0.07) + Math.random() * 0.12, t0: t, last: t };
+      const p = spiralPos(a);
+      a.off = { x: s.c.x - p.x, y: s.c.y - p.y };
+      s.anim = a;
+    });
+    if (!flushing) { flushing = true; flushStart = t; }
+    setStatus('Flushing…');
+  }
+
+  // Inside the bowl, the orbit flattens to the bowl's own oval.
+  function spiralPos(a) {
+    const B = toilet.bowl;
+    const k0 = clamp(B.b / B.a, 0.35, 1.2);
+    const k = k0 + (1 - k0) * clamp((a.r - B.a) / (1.5 * B.a), 0, 1);
+    return { x: B.cx + Math.cos(a.phi) * a.r, y: B.cy + Math.sin(a.phi) * a.r * k };
+  }
+
+  function updateAnim(s, t, dt) {
+    const a = s.anim, B = toilet.bowl, R = B.a;
+    const te = t - a.t0 - a.delay;
+    if (te < 0) { a.wobble = Math.sin(t * 40 + s.id) * 0.04 * smooth((te + a.delay) / 0.3); return; }
+    a.wobble = 0;
+    const ramp = smooth(te / 0.7);
+
+    // Radial pull: accelerating approach outside, exponential decay (log spiral) inside.
+    let vr;
+    if (a.r > R) vr = ((0.6 + 1.6 * Math.min(te, 1.6)) * (a.r - 0.8 * R) + 40) * ramp;
+    else vr = 1.05 * a.r + 3;
+    // Rotation: faster the closer it gets.
+    const omega = Math.min(26, 1.8 * Math.pow(R / Math.max(a.r, 4), 1.15)) * ramp;
+
+    a.r = Math.max(0, a.r - vr * dt);
+    a.phi += omega * dt;
+    a.rot += omega * dt * 0.85;
+
+    const decay = Math.exp(-5 * dt);
+    a.off.x *= decay; a.off.y *= decay;
+
+    // Shrink: big strokes get squeezed to fit the bowl, everything shrinks to nothing at the center.
+    const fit = Math.min(1, (1.5 * R) / s.size);
+    const near = 1 - clamp((a.r - R) / (3 * R), 0, 1);
+    const sFit = 1 + (fit - 1) * smooth(near);
+    const sIn = a.r > 1.4 * R ? 1 : Math.pow(a.r / (1.4 * R), 0.85);
+    a.s = sFit * sIn;
+    a.alpha = a.r > 0.55 * R ? 1 : Math.pow(a.r / (0.55 * R), 0.7);
+    if (a.r < 1.5 || a.s < 0.015) a.done = true;
+  }
+
+  // ---------- rendering ----------
+  function tracePath(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    if (pts.length < 3) { ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y); return; }
+    for (let i = 1; i < pts.length - 1; i++) {
+      const mx = (pts[i].x + pts[i + 1].x) / 2, my = (pts[i].y + pts[i + 1].y) / 2;
+      ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+    }
+    const l = pts[pts.length - 1];
+    ctx.lineTo(l.x, l.y);
+  }
+
+  function drawWhirlpool(t) {
+    if (!toilet || swirl < 0.01) return;
+    const { cx, cy, a, b } = toilet.bowl;
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, Math.max(a - 4, 1), Math.max(b - 4, 1), 0, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.lineWidth = 1.4;
+    ctx.lineCap = 'round';
+    const base = t * 5.5;
+    for (let arm = 0; arm < 3; arm++) {
+      ctx.strokeStyle = `rgba(0,0,0,${0.2 * swirl})`;
+      ctx.beginPath();
+      const steps = 70;
+      for (let i = 0; i <= steps; i++) {
+        const u = i / steps;
+        const rr = 0.9 * (1 - u) + 0.04;
+        const ang = base + arm * (Math.PI * 2 / 3) + u * Math.PI * 3.2;
+        const x = cx + Math.cos(ang) * a * rr, y = cy + Math.sin(ang) * b * rr;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  let lastT = now();
+  function frame() {
+    const t = now();
+    const dt = Math.min(0.05, t - lastT);
+    lastT = t;
+
+    // update
+    if (toilet) {
+      for (const s of strokes) if (s.anim) updateAnim(s, t, dt);
+      strokes = strokes.filter((s) => !(s.anim && s.anim.done));
+      const active = strokes.some((s) => s.anim);
+      swirl += ((active ? 1 : 0) - swirl) * Math.min(1, dt * (active ? 3 : 1.5));
+      if (flushing && !active) {
+        flushing = false;
+        setStatus('Flushed. Draw more and pause — it flushes again.');
+      }
+    }
+
+    // draw
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#111';
+
+    drawWhirlpool(t);
+
+    // toilet: a small pulse on detection, a rumble while flushing
+    let jx = 0, jy = 0, pulse = 0;
+    if (toilet) {
+      const sinceDetect = t - toilet.detectedAt;
+      pulse = sinceDetect < 0.5 ? Math.sin(sinceDetect / 0.5 * Math.PI) : 0;
+      if (flushing) {
+        const e = Math.max(0, 1 - (t - flushStart) / 0.9);
+        jx = Math.sin(t * 70) * 1.6 * e;
+        jy = Math.cos(t * 53) * 0.8 * e;
+      }
+    }
+
+    for (const s of strokes) {
+      if (s.role === 'toilet') {
+        ctx.save();
+        ctx.translate(jx, jy);
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = LINE + pulse * 2.5;
+        tracePath(s.pts);
+        ctx.stroke();
+        ctx.restore();
+      } else if (s.anim) {
+        const a = s.anim;
+        const p = spiralPos(a);
+        ctx.save();
+        ctx.globalAlpha = a.alpha;
+        ctx.translate(p.x + a.off.x, p.y + a.off.y);
+        ctx.rotate(a.rot + (a.wobble || 0));
+        ctx.scale(a.s, a.s);
+        ctx.translate(-s.c.x, -s.c.y);
+        ctx.lineWidth = LINE;
+        tracePath(s.pts);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.lineWidth = LINE;
+        tracePath(s.pts);
+        ctx.stroke();
+      }
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ---------- UI ----------
+  drawBtn.addEventListener('click', () => {
+    drawMode = !drawMode;
+    drawBtn.setAttribute('aria-pressed', String(drawMode));
+    document.body.classList.toggle('nodraw', !drawMode);
+  });
+
+  document.getElementById('reset').addEventListener('click', () => {
+    clearTimeout(idleTimer); clearTimeout(flushTimer);
+    strokes = []; current = null; toilet = null; flushing = false; swirl = 0;
+    guideEl.classList.remove('hidden');
+    setStatus('Draw anything. Then draw a toilet.');
+  });
+
+  document.getElementById('save').addEventListener('click', () => {
+    cv.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'flush-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.png';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }, 'image/png');
+  });
+
+  // expose for testing in the console
+  window.__flush = { get strokes() { return strokes; }, get toilet() { return toilet; } };
+})();
+</script>
+</body>
+</html>
